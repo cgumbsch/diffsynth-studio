@@ -648,6 +648,30 @@ def launch_training_task(
         val_interval = args.val_interval # 5
     writer = SummaryWriter(log_dir=os.path.join(args.output_path, "tensorboard") if args is not None else "./tensorboard")
 
+    # Optional W&B mirror. Only the main process initialises wandb; init must
+    # happen before Accelerator.prepare so the run is alive for the whole
+    # training loop. We import lazily so the diffsynth install stays slim
+    # when wandb isn't requested.
+    wandb_run = None
+    wandb_project = getattr(args, "wandb_project", None) if args is not None else None
+    if wandb_project:
+        try:
+            import wandb as _wandb
+        except ImportError:
+            print("[trainer] --wandb_project set but wandb is not installed; skipping W&B logging")
+        else:
+            run_name = getattr(args, "wandb_run_name", None) or os.path.basename(
+                os.path.normpath(args.output_path)
+            )
+            wandb_run = _wandb.init(
+                project=wandb_project,
+                name=run_name,
+                entity=getattr(args, "wandb_entity", None),
+                dir=args.output_path,
+                config=vars(args),
+                reinit=True,
+            )
+
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
@@ -683,6 +707,8 @@ def launch_training_task(
 
                 if accelerator.is_main_process:
                     writer.add_scalar("Loss/step", loss.item(), global_step)
+                    if wandb_run is not None:
+                        wandb_run.log({"loss_step": loss.item()}, step=global_step)
                 epoch_loss += loss.item()
                 epoch_steps += 1
                 global_step += 1
@@ -692,6 +718,11 @@ def launch_training_task(
                     break
         if accelerator.is_main_process and epoch_steps > 0:
             writer.add_scalar("Loss/epoch", epoch_loss / epoch_steps, epoch_id)
+            if wandb_run is not None:
+                wandb_run.log(
+                    {"loss_epoch": epoch_loss / epoch_steps, "epoch": epoch_id},
+                    step=global_step,
+                )
 
         if val_dataloader is not None and (epoch_id + 1) % val_interval == 0:
             model.eval()
@@ -720,6 +751,11 @@ def launch_training_task(
                 if accelerator.is_main_process:
                     writer.add_scalar("Loss/val_epoch", avg_val_loss, epoch_id)
                     print(f"Epoch {epoch_id} Validation Loss: {avg_val_loss}")
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {"val_loss_epoch": avg_val_loss, "epoch": epoch_id},
+                            step=global_step,
+                        )
             
             model.train() 
             # --------------------
@@ -727,6 +763,8 @@ def launch_training_task(
             model_logger.on_epoch_end(accelerator, model, epoch_id)
     model_logger.on_training_end(accelerator, model, save_steps)
     writer.close()
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 def launch_data_process_task(
@@ -786,7 +824,10 @@ def wan_parser():
     parser.add_argument("--save_epochs", type=int, default=1, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
-    
+    parser.add_argument("--wandb_project", type=str, default=None, help="If set, mirror tensorboard scalars to this W&B project (e.g. 'Wan').")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Optional W&B run name. Defaults to the basename of --output_path.")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Optional W&B entity/team. Falls back to $WANDB_ENTITY then the user's default.")
+
     return parser
 
 
