@@ -111,7 +111,10 @@ def load_model_from_single_file(state_dict, model_names, model_classes, model_re
         # model.load_state_dict(model_state_dict, assign=True)
         model = model.to_empty(device=device)
         # debug_state_dict_mismatch(model, model_state_dict)
-        model.load_state_dict(model_state_dict, strict=False, assign=True)
+        load_result = model.load_state_dict(model_state_dict, strict=False, assign=True)
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            print(f"    [{model_name}] load_state_dict missing_keys ({len(load_result.missing_keys)}): {load_result.missing_keys}")
+            print(f"    [{model_name}] load_state_dict unexpected_keys ({len(load_result.unexpected_keys)}): {load_result.unexpected_keys}")
         # 如果模型有action_mlp1属性，则初始化它,这个应该仅在训练时生效
         if hasattr(model, "action_mlp1"):
             print("    Checking action_mlp1 weights for NaN/Inf...")
