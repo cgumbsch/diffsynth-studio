@@ -654,7 +654,9 @@ def launch_training_task(
     # when wandb isn't requested.
     wandb_run = None
     wandb_project = getattr(args, "wandb_project", None) if args is not None else None
-    if wandb_project:
+    # Gate on global RANK so accelerate launch only initialises one W&B run per
+    # job, regardless of how many processes (8 GPUs => 8 ranks here).
+    if wandb_project and os.environ.get("RANK", "0") == "0":
         try:
             import wandb as _wandb
         except ImportError:
