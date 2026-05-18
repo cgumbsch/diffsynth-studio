@@ -609,6 +609,21 @@ class ModelLogger:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
 
 
+    def save_named_checkpoint(self, accelerator, model, name):
+        # Rotating checkpoint write: always overwrites {output_path}/{name}.safetensors.
+        # Used by launch_training_task to keep exactly two files on disk: "latest"
+        # (every save_epochs) and "best" (only when val_loss improves).
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            state_dict = accelerator.get_state_dict(model)
+            state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
+            state_dict = self.state_dict_converter(state_dict)
+            os.makedirs(self.output_path, exist_ok=True)
+            path = os.path.join(self.output_path, f"{name}.safetensors")
+            accelerator.save(state_dict, path, safe_serialization=True)
+            print(f"[trainer] saved {name} checkpoint to {path}")
+
+
     def save_model(self, accelerator, model, file_name):
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
@@ -687,6 +702,7 @@ def launch_training_task(
     global_step = 0
     epoch_loss = 0.0
     epoch_steps = 0
+    best_val_loss = float("inf")
 
     for epoch_id in range(num_epochs):
 
@@ -749,20 +765,25 @@ def launch_training_task(
                         break
             
             if val_steps > 0:
-                avg_val_loss = val_loss / val_steps
+                avg_val_loss = val_loss / val_steps  # same on all ranks (gather+mean inside loop)
+                improved = avg_val_loss < best_val_loss
+                if improved:
+                    best_val_loss = avg_val_loss
                 if accelerator.is_main_process:
                     writer.add_scalar("Loss/val_epoch", avg_val_loss, epoch_id)
-                    print(f"Epoch {epoch_id} Validation Loss: {avg_val_loss}")
+                    print(f"Epoch {epoch_id} Validation Loss: {avg_val_loss}" + (" [NEW BEST]" if improved else ""))
                     if wandb_run is not None:
                         wandb_run.log(
-                            {"val_loss_epoch": avg_val_loss, "epoch": epoch_id},
+                            {"val_loss_epoch": avg_val_loss, "best_val_loss": best_val_loss, "epoch": epoch_id},
                             step=global_step,
                         )
-            
-            model.train() 
+                if improved:
+                    model_logger.save_named_checkpoint(accelerator, model, "best")
+
+            model.train()
             # --------------------
         if save_steps is None and (epoch_id + 1) % save_epochs == 0:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
+            model_logger.save_named_checkpoint(accelerator, model, "latest")
     model_logger.on_training_end(accelerator, model, save_steps)
     writer.close()
     if wandb_run is not None:
