@@ -115,53 +115,38 @@ def load_model_from_single_file(state_dict, model_names, model_classes, model_re
         if os.environ.get("LOCAL_RANK", "0") == "0":
             print(f"    [{model_name}] load_state_dict missing_keys ({len(load_result.missing_keys)}): {load_result.missing_keys}")
             print(f"    [{model_name}] load_state_dict unexpected_keys ({len(load_result.unexpected_keys)}): {load_result.unexpected_keys}")
-        # 如果模型有action_mlp1属性，则初始化它,这个应该仅在训练时生效
+        # ALWAYS reinitialize action_mlp1/2 — do NOT conditionally "keep original".
+        # The prior conditional ("if NaN/Inf detected reinit, else keep original")
+        # was unsafe because the "original" weights are uninitialized CUDA memory:
+        # load_state_dict(strict=False) on the base Wan2.2 ckpt leaves
+        # action_mlp1/2 as missing_keys, and the model was created via
+        # model.to_empty(device=...) which leaves contents at torch.empty()
+        # values (whatever was last in that memory page). Some runs landed on
+        # NaN-containing garbage → reinit fired; other runs landed on
+        # finite-but-uninitialized garbage → "keep original" left random nonsense
+        # in place. DeepSpeed.prepare() then broadcasts whatever rank 0 happens
+        # to hold, so the model state at step 0 depended entirely on rank 0's
+        # memory luck. Verified on this fork: job 1227 (H200, rank 0 reinit'd)
+        # → step-0 loss 0.05-0.95 healthy; job 1723 (L40S, rank 0 kept garbage)
+        # → step-0 loss 4e13-1.3e15, recovery only to ~1e9 by epoch 200, never
+        # converged. Same code, same data, same recipe — only hardware-dependent
+        # CUDA memory state differed. Always-reinit makes the start state
+        # deterministic across hardware and runs.
         if hasattr(model, "action_mlp1"):
-            print("    Checking action_mlp1 weights for NaN/Inf...")
-            need_init1 = False
+            print("    Initializing action_mlp1 with xavier_uniform (always, deterministic).")
             for m in model.action_mlp1:
                 if isinstance(m, torch.nn.Linear):
-                    if torch.isnan(m.weight).any() or torch.isinf(m.weight).any():
-                        need_init1 = True
-                        break
-                    if m.bias is not None and (torch.isnan(m.bias).any() or torch.isinf(m.bias).any()):
-                        need_init1 = True
-                        break
+                    torch.nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        torch.nn.init.zeros_(m.bias)
 
-            if need_init1:
-                print("    action_mlp1 contains NaN/Inf, reinitializing weights...")
-                for m in model.action_mlp1:
-                    if isinstance(m, torch.nn.Linear):
-                        # torch.nn.init.normal_(m.weight, 0, 0.01)
-                        torch.nn.init.xavier_uniform_(m.weight)
-                        if m.bias is not None:
-                            torch.nn.init.zeros_(m.bias)
-            else:
-                print("    action_mlp1 weights are fine, keeping original values.")
-
-        # 如果模型有action_mlp2属性，则初始化它,这个应该仅在训练时生效
         if hasattr(model, "action_mlp2"):
-            print("    Checking action_mlp2 weights for NaN/Inf...")
-            need_init2 = False
+            print("    Initializing action_mlp2 with xavier_uniform (always, deterministic).")
             for m in model.action_mlp2:
                 if isinstance(m, torch.nn.Linear):
-                    if torch.isnan(m.weight).any() or torch.isinf(m.weight).any():
-                        need_init2 = True
-                        break
-                    if m.bias is not None and (torch.isnan(m.bias).any() or torch.isinf(m.bias).any()):
-                        need_init2 = True
-                        break
-
-            if need_init2:
-                print("    action_mlp2 contains NaN/Inf, reinitializing weights...")
-                for m in model.action_mlp2:
-                    if isinstance(m, torch.nn.Linear):
-                        # torch.nn.init.normal_(m.weight, 0, 0.01)
-                        torch.nn.init.xavier_uniform_(m.weight)
-                        if m.bias is not None:
-                            torch.nn.init.zeros_(m.bias)
-            else:
-                print("    action_mlp2 weights are fine, keeping original values.")
+                    torch.nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        torch.nn.init.zeros_(m.bias)
 
 
         model = model.to(dtype=torch_dtype) 
