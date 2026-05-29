@@ -624,6 +624,50 @@ class ModelLogger:
             print(f"[trainer] saved {name} checkpoint to {path}")
 
 
+    def save_resume_state(self, accelerator, start_epoch, best_val_loss, global_step):
+        # Full resume artefact for spot-preemption / walltime survival.
+        # Writes {output_path}/state/ with the accelerate state (model + optimizer
+        # + scheduler + RNG, sharded by ZeRO if active) plus a sidecar JSON
+        # holding the three Python-side counters that the epoch loop needs to
+        # continue from. accelerate.save_state writes to a temp dir and
+        # renames, so a SIGTERM mid-write does not corrupt the on-disk state.
+        # Called alongside the "latest" model save (every save_epochs).
+        state_dir = os.path.join(self.output_path, "state")
+        accelerator.save_state(state_dir)
+        if accelerator.is_main_process:
+            meta = {
+                "start_epoch": start_epoch,
+                "best_val_loss": best_val_loss,
+                "global_step": global_step,
+            }
+            meta_path = os.path.join(state_dir, "resume_meta.json")
+            with open(meta_path, "w") as f:
+                json.dump(meta, f)
+            print(f"[trainer] saved resume state to {state_dir} (start_epoch={start_epoch}, best_val_loss={best_val_loss:.6f}, global_step={global_step})")
+
+
+    def load_resume_state(self, accelerator, resume_dir):
+        # Restores the accelerate state and reads the sidecar JSON. Returns
+        # (start_epoch, best_val_loss, global_step). If the sidecar is missing
+        # or unreadable, we fall back to (0, inf, 0) so the run starts fresh
+        # rather than silently mis-counting — accelerate state still loads.
+        accelerator.load_state(resume_dir)
+        meta_path = os.path.join(resume_dir, "resume_meta.json")
+        if os.path.isfile(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            start_epoch = int(meta.get("start_epoch", 0))
+            best_val_loss = float(meta.get("best_val_loss", float("inf")))
+            global_step = int(meta.get("global_step", 0))
+        else:
+            if accelerator.is_main_process:
+                print(f"[trainer] resume_meta.json missing under {resume_dir}; counters reset to 0/inf/0 (model+optim state still loaded)")
+            start_epoch, best_val_loss, global_step = 0, float("inf"), 0
+        if accelerator.is_main_process:
+            print(f"[trainer] resumed from {resume_dir}: start_epoch={start_epoch}, best_val_loss={best_val_loss:.6f}, global_step={global_step}")
+        return start_epoch, best_val_loss, global_step
+
+
     def save_model(self, accelerator, model, file_name):
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
@@ -667,6 +711,10 @@ def launch_training_task(
     # happen before Accelerator.prepare so the run is alive for the whole
     # training loop. We import lazily so the diffsynth install stays slim
     # when wandb isn't requested.
+    # resume="allow" composes with the WANDB_RUN_ID env var: when the caller
+    # sets WANDB_RUN_ID to a stable id (e.g. via the sbatch keyed off
+    # $SLURM_JOB_NAME) the run continues across requeues; when it isn't set
+    # wandb generates a fresh id and resume="allow" is a no-op.
     wandb_run = None
     wandb_project = getattr(args, "wandb_project", None) if args is not None else None
     # Gate on global RANK so accelerate launch only initialises one W&B run per
@@ -687,6 +735,7 @@ def launch_training_task(
                 dir=args.output_path,
                 config=vars(args),
                 reinit=True,
+                resume="allow",
             )
 
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
@@ -699,12 +748,30 @@ def launch_training_task(
     )
     model, optimizer, dataloader, val_dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, val_dataloader, scheduler)
 
+    # Resume-from-state hook for spot-preemption / walltime survival.
+    # When --resume_dir is set and points at a previously-saved state/ dir
+    # (written by ModelLogger.save_resume_state), restore the full training
+    # state — model weights, optimizer (Adam moments + master copy), scheduler,
+    # RNG, and the three Python-side counters (start_epoch, best_val_loss,
+    # global_step). Without this, an sbatch --requeue under a trainer with no
+    # resume logic silently restarts from epoch 0 each time, losing all prior
+    # work; with this in place, each requeue continues from the most recent
+    # save_epochs checkpoint.
+    start_epoch = 0
     global_step = 0
+    best_val_loss = float("inf")
+    resume_dir = getattr(args, "resume_dir", None) if args is not None else None
+    if resume_dir and os.path.isdir(resume_dir):
+        if accelerator.is_main_process:
+            print(f"[trainer] --resume_dir={resume_dir} exists; restoring full state")
+        start_epoch, best_val_loss, global_step = model_logger.load_resume_state(accelerator, resume_dir)
+    elif resume_dir and accelerator.is_main_process:
+        print(f"[trainer] --resume_dir={resume_dir} does not exist; starting fresh")
+
     epoch_loss = 0.0
     epoch_steps = 0
-    best_val_loss = float("inf")
 
-    for epoch_id in range(num_epochs):
+    for epoch_id in range(start_epoch, num_epochs):
 
         epoch_loss = 0.0
         epoch_steps = 0
@@ -784,6 +851,10 @@ def launch_training_task(
             # --------------------
         if save_steps is None and (epoch_id + 1) % save_epochs == 0:
             model_logger.save_named_checkpoint(accelerator, model, "latest")
+            # Pair the rotating model save with a rotating resume-state save.
+            # start_epoch=epoch_id+1 because that's the NEXT epoch to run on
+            # resume (this epoch's gradients have already been applied).
+            model_logger.save_resume_state(accelerator, epoch_id + 1, best_val_loss, global_step)
     model_logger.on_training_end(accelerator, model, save_steps)
     writer.close()
     if wandb_run is not None:
@@ -850,6 +921,7 @@ def wan_parser():
     parser.add_argument("--wandb_project", type=str, default=None, help="If set, mirror tensorboard scalars to this W&B project (e.g. 'Wan').")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Optional W&B run name. Defaults to the basename of --output_path.")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Optional W&B entity/team. Falls back to $WANDB_ENTITY then the user's default.")
+    parser.add_argument("--resume_dir", type=str, default=None, help="Optional path to a state/ dir written by a previous run's ModelLogger.save_resume_state. When set and the dir exists, training restores model+optimizer+scheduler+RNG via accelerate.load_state and continues from the saved start_epoch / best_val_loss / global_step. Pair with WANDB_RUN_ID + WANDB_RESUME=allow env vars to continue the same wandb run across requeues.")
 
     return parser
 
